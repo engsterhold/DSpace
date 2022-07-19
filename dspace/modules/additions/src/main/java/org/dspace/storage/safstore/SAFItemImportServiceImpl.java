@@ -5,7 +5,7 @@
  *
  * http://www.dspace.org/license/
  */
-package org.dspace.app.itemimport;
+package org.dspace.storage.safstore;
 
 import static org.dspace.iiif.util.IIIFSharedUtils.METADATA_IIIF_HEIGHT_QUALIFIER;
 import static org.dspace.iiif.util.IIIFSharedUtils.METADATA_IIIF_IMAGE_ELEMENT;
@@ -29,6 +29,9 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.io.PrintWriter;
 import java.net.URL;
+import java.nio.file.AccessDeniedException;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.sql.SQLException;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
@@ -51,7 +54,10 @@ import javax.xml.parsers.DocumentBuilder;
 import javax.xml.parsers.DocumentBuilderFactory;
 import javax.xml.parsers.ParserConfigurationException;
 import javax.xml.transform.TransformerException;
-
+import javax.xml.xpath.XPath;
+import javax.xml.xpath.XPathConstants;
+import javax.xml.xpath.XPathExpressionException;
+import javax.xml.xpath.XPathFactory;
 import org.apache.commons.collections4.ComparatorUtils;
 import org.apache.commons.io.FileDeleteStrategy;
 import org.apache.commons.io.FileUtils;
@@ -59,7 +65,6 @@ import org.apache.commons.lang3.RandomStringUtils;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.commons.lang3.exception.ExceptionUtils;
 import org.apache.logging.log4j.Logger;
-import org.apache.xpath.XPathAPI;
 import org.dspace.app.itemimport.service.ItemImportService;
 import org.dspace.app.util.LocalSchemaFilenameFilter;
 import org.dspace.app.util.RelationshipUtils;
@@ -103,16 +108,17 @@ import org.dspace.eperson.service.EPersonService;
 import org.dspace.eperson.service.GroupService;
 import org.dspace.handle.service.HandleService;
 import org.dspace.services.ConfigurationService;
+import org.dspace.storage.safstore.service.SAFItemImportService;
 import org.dspace.workflow.WorkflowItem;
 import org.dspace.workflow.WorkflowService;
 import org.springframework.beans.factory.InitializingBean;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.dspace.app.itemimport.*;
 import org.w3c.dom.Document;
 import org.w3c.dom.NamedNodeMap;
 import org.w3c.dom.Node;
 import org.w3c.dom.NodeList;
 import org.xml.sax.SAXException;
-
 
 /**
  * Import items into DSpace. The conventional use is upload files by copying
@@ -130,8 +136,8 @@ import org.xml.sax.SAXException;
  * Modified by David Little, UCSD Libraries 12/21/04 to
  * allow the registration of files (bitstreams) into DSpace.
  */
-public class ItemImportServiceImpl implements ItemImportService, InitializingBean {
-    private final Logger log = org.apache.logging.log4j.LogManager.getLogger(ItemImportServiceImpl.class);
+public class SAFItemImportServiceImpl implements SAFItemImportService, InitializingBean {
+    private final Logger log = org.apache.logging.log4j.LogManager.getLogger(SAFItemImportServiceImpl.class);
 
     @Autowired(required = true)
     protected AuthorizeService authorizeService;
@@ -173,20 +179,23 @@ public class ItemImportServiceImpl implements ItemImportService, InitializingBea
     protected MetadataValueService metadataValueService;
 
     protected String tempWorkDir;
+    protected String safStoreDir;
 
     protected boolean isTest = false;
     protected boolean isResume = false;
     protected boolean useWorkflow = false;
     protected boolean useWorkflowSendEmail = false;
     protected boolean isQuiet = false;
+    protected int importMode = -1;
+    protected String[] safItems = { "dublin_core.xml", "contents" };
 
-    //remember which folder item was imported from
+    // remember which folder item was imported from
     Map<String, Item> itemFolderMap = null;
 
     @Override
     public void afterPropertiesSet() throws Exception {
         tempWorkDir = configurationService.getProperty("org.dspace.app.batchitemimport.work.dir");
-        //Ensure tempWorkDir exists
+        // Ensure tempWorkDir exists
         File tempWorkDirFile = new File(tempWorkDir);
         if (!tempWorkDirFile.exists()) {
             boolean success = tempWorkDirFile.mkdir();
@@ -195,6 +204,12 @@ public class ItemImportServiceImpl implements ItemImportService, InitializingBea
             } else {
                 log.error("Cannot create batch import directory! " + tempWorkDir);
             }
+        }
+        safStoreDir = configurationService.getProperty("safstore.dir");
+        File safStoreDirFile = new File(safStoreDir);
+        if (!(safStoreDirFile.exists() && safStoreDirFile.isDirectory())) {
+            throw new FileNotFoundException(
+                    "safStoreDir.dir is not set or does not point to a folder. safStoreDir: " + safStoreDir);
         }
     }
 
@@ -210,14 +225,32 @@ public class ItemImportServiceImpl implements ItemImportService, InitializingBea
         }
     };
 
-    protected ItemImportServiceImpl() {
-        //Protected consumer to ensure that we use spring to create a bean, NEVER make this public
+    protected SAFItemImportServiceImpl() {
+        // Protected consumer to ensure that we use spring to create a bean, NEVER make
+        // this public
+
     }
 
+    // chekc if the import item is part of the saf store
+    // TODO: More sanitizing
+    protected boolean checkFilePath(String sourceDir) {
+
+        return Paths.get(sourceDir).startsWith(safStoreDir);
+
+    }
+
+    // If the source path is three layers deep it is in single item mode if it is
+    // two it is in collection mode, everything else should raise an error
+    protected int checkImportMode(String sourceDir) {
+        Path relativePath = Paths.get(safStoreDir).relativize(Paths.get(sourceDir));
+        List<Path> list = new ArrayList<Path>();
+        relativePath.iterator().forEachRemaining(list::add);
+        return list.size();
+    }
 
     @Override
     public void addItemsAtomic(Context c, List<Collection> mycollections, String sourceDir, String mapFile,
-                               boolean template) throws Exception {
+            boolean template) throws Exception {
         try {
             addItems(c, mycollections, sourceDir, mapFile, template);
         } catch (Exception addException) {
@@ -230,12 +263,22 @@ public class ItemImportServiceImpl implements ItemImportService, InitializingBea
 
     @Override
     public void addItems(Context c, List<Collection> mycollections,
-                         String sourceDir, String mapFile, boolean template) throws Exception {
+            String sourceDir, String mapFile, boolean template) throws Exception {
+
+        if (!checkFilePath(sourceDir)) {
+            throw new AccessDeniedException("source dir is not child of the saf store. SourceDir" + sourceDir
+                    + " safStore: " + safStoreDir);
+        }
+        importMode = checkImportMode(sourceDir);
+        System.out.print("Depth of Item: " + importMode);
+
         // create the mapfile
         File outFile = null;
         PrintWriter mapOut = null;
-
+        System.out.println("SAF Store folder" + configurationService.getProperty("safstore.dir"));
+        System.out.println("Incoming store" + configurationService.getProperty("assetstore.incoming"));
         try {
+
             Map<String, String> skipItems = new HashMap<>(); // set of items to skip if in 'resume'
             // mode
 
@@ -270,11 +313,29 @@ public class ItemImportServiceImpl implements ItemImportService, InitializingBea
             // open and process the source directory
             File d = new java.io.File(sourceDir);
 
+            System.out.println("File d: " + d.getName());
+            log.debug("File d: " + d.getName());
+
             if (d == null || !d.isDirectory()) {
                 throw new Exception("Error, cannot open source directory " + sourceDir);
             }
 
-            String[] dircontents = d.list(directoryFilter);
+            String[] dircontents;
+
+            if (importMode == 3 && Arrays.asList(d.list()).containsAll(Arrays.asList(safItems))) {
+                System.out.println(Arrays.toString(d.list()) + " contains: dublin_core.xml");
+                log.debug(Arrays.toString(d.list()) + " contains: dublin_core.xml");
+                dircontents = new String[] { "." };
+
+            } else if (importMode == 2) {
+
+                System.out.println(Arrays.toString(d.list()) + " contains no: dublin_core.xml");
+                log.debug(Arrays.toString(d.list()) + " contains no: dublin_core.xml");
+                dircontents = d.list(directoryFilter);
+
+            } else {
+                throw new AccessDeniedException("importMode needs to be 2 or 3 is: " + importMode);
+            }
 
             Arrays.sort(dircontents, ComparatorUtils.naturalComparator());
 
@@ -282,7 +343,7 @@ public class ItemImportServiceImpl implements ItemImportService, InitializingBea
                 if (skipItems.containsKey(dircontents[i])) {
                     System.out.println("Skipping import of " + dircontents[i]);
 
-                    //we still need the item in the map for relationship linking
+                    // we still need the item in the map for relationship linking
                     String skippedHandle = skipItems.get(dircontents[i]);
                     Item skippedItem = (Item) handleService.resolveToObject(c, skippedHandle);
                     itemFolderMap.put(dircontents[i], skippedItem);
@@ -295,7 +356,7 @@ public class ItemImportServiceImpl implements ItemImportService, InitializingBea
                             List<Collection> cols = processCollectionFile(c, path, "collections");
                             if (cols == null) {
                                 System.out
-                                    .println("No collections specified for item " + dircontents[i] + ". Skipping.");
+                                        .println("No collections specified for item " + dircontents[i] + ". Skipping.");
                                 continue;
                             }
                             clist = cols;
@@ -316,7 +377,7 @@ public class ItemImportServiceImpl implements ItemImportService, InitializingBea
                 }
             }
 
-            //now that all items are imported, iterate again to link relationships
+            // now that all items are imported, iterate again to link relationships
             addRelationships(c, sourceDir);
 
         } finally {
@@ -327,13 +388,13 @@ public class ItemImportServiceImpl implements ItemImportService, InitializingBea
         }
     }
 
-     /**
-      * Add relationships from a 'relationships' manifest file.
-      * 
-      * @param c Context
-      * @param sourceDir The parent import source directory
-      * @throws Exception
-      */
+    /**
+     * Add relationships from a 'relationships' manifest file.
+     * 
+     * @param c         Context
+     * @param sourceDir The parent import source directory
+     * @throws Exception
+     */
     protected void addRelationships(Context c, String sourceDir) throws Exception {
 
         for (Map.Entry<String, Item> itemEntry : itemFolderMap.entrySet()) {
@@ -342,7 +403,7 @@ public class ItemImportServiceImpl implements ItemImportService, InitializingBea
             String path = sourceDir + File.separatorChar + folderName;
             Item item = itemEntry.getValue();
 
-            //look for a 'relationship' manifest
+            // look for a 'relationship' manifest
             Map<String, List<String>> relationships = processRelationshipFile(path, "relationships");
             if (!relationships.isEmpty()) {
 
@@ -355,32 +416,31 @@ public class ItemImportServiceImpl implements ItemImportService, InitializingBea
 
                         if (isTest) {
                             System.out.println("\tAdding relationship (type: " + relationshipType +
-                                ") from " + folderName + " to " + itemIdentifier);
+                                    ") from " + folderName + " to " + itemIdentifier);
                             continue;
                         }
 
-                        //find referenced item
+                        // find referenced item
                         Item relationItem = resolveRelatedItem(c, itemIdentifier);
                         if (null == relationItem) {
                             throw new Exception("Could not find item for " + itemIdentifier);
                         }
 
-                        //get entity type of entity and item
+                        // get entity type of entity and item
                         String itemEntityType = getEntityType(item);
                         String relatedEntityType = getEntityType(relationItem);
 
-                        //find matching relationship type
+                        // find matching relationship type
                         List<RelationshipType> relTypes = relationshipTypeService.findByLeftwardOrRightwardTypeName(
-                            c, relationshipType);
+                                c, relationshipType);
                         RelationshipType foundRelationshipType = RelationshipUtils.matchRelationshipType(
-                            relTypes, relatedEntityType, itemEntityType, relationshipType);
+                                relTypes, relatedEntityType, itemEntityType, relationshipType);
 
                         if (foundRelationshipType == null) {
                             throw new Exception("No Relationship type found for:\n" +
-                                "Target type: " + relatedEntityType + "\n" +
-                                "Origin referer type: " + itemEntityType + "\n" +
-                                "with typeName: " + relationshipType
-                            );
+                                    "Target type: " + relatedEntityType + "\n" +
+                                    "Origin referer type: " + itemEntityType + "\n" +
+                                    "with typeName: " + relationshipType);
                         }
 
                         boolean left = false;
@@ -403,11 +463,11 @@ public class ItemImportServiceImpl implements ItemImportService, InitializingBea
                         int leftPlace = relationshipService.findNextLeftPlaceByLeftItem(c, leftItem);
                         int rightPlace = relationshipService.findNextRightPlaceByRightItem(c, rightItem);
                         Relationship persistedRelationship = relationshipService.create(
-                            c, leftItem, rightItem, foundRelationshipType, leftPlace, rightPlace);
+                                c, leftItem, rightItem, foundRelationshipType, leftPlace, rightPlace);
                         // relationshipService.update(c, persistedRelationship);
 
                         System.out.println("\tAdded relationship (type: " + relationshipType + ") from " +
-                            leftItem.getHandle() + " to " + rightItem.getHandle());
+                                leftItem.getHandle() + " to " + rightItem.getHandle());
 
                     }
 
@@ -432,13 +492,16 @@ public class ItemImportServiceImpl implements ItemImportService, InitializingBea
     /**
      * Read the relationship manifest file.
      * 
-     * Each line in the file contains a relationship type id and an item identifier in the following format:
+     * Each line in the file contains a relationship type id and an item identifier
+     * in the following format:
      * 
-     * relation.<relation_key> <handle|uuid|folderName:import_item_folder|schema.element[.qualifier]:value>
+     * relation.<relation_key>
+     * <handle|uuid|folderName:import_item_folder|schema.element[.qualifier]:value>
      * 
-     * The input_item_folder should refer the folder name of another item in this import batch.
+     * The input_item_folder should refer the folder name of another item in this
+     * import batch.
      * 
-     * @param path The main import folder path.
+     * @param path     The main import folder path.
      * @param filename The name of the manifest file to check ('relationships')
      * @return Map of found relationships
      * @throws Exception
@@ -507,24 +570,27 @@ public class ItemImportServiceImpl implements ItemImportService, InitializingBea
         return result;
     }
 
-     /**
-      * Resolve an item identifier referred to in the relationships manifest file.
-      *
-      * The import item map will be checked first to see if the identifier refers to an item folder
-      * that was just imported. Next it will try to find the item by handle or UUID, or by a unique
-      * meta value.
-      * 
-      * @param c Context
-      * @param itemIdentifier The identifier string found in the import manifest (handle, uuid, or import subfolder)
-      * @return Item if found, or null.
-      * @throws Exception
-      */
+    /**
+     * Resolve an item identifier referred to in the relationships manifest file.
+     *
+     * The import item map will be checked first to see if the identifier refers to
+     * an item folder
+     * that was just imported. Next it will try to find the item by handle or UUID,
+     * or by a unique
+     * meta value.
+     * 
+     * @param c              Context
+     * @param itemIdentifier The identifier string found in the import manifest
+     *                       (handle, uuid, or import subfolder)
+     * @return Item if found, or null.
+     * @throws Exception
+     */
     protected Item resolveRelatedItem(Context c, String itemIdentifier) throws Exception {
 
         if (itemIdentifier.contains(":")) {
 
             if (itemIdentifier.startsWith("folderName:") || itemIdentifier.startsWith("rowName:")) {
-                //identifier refers to a folder name in this import
+                // identifier refers to a folder name in this import
                 int i = itemIdentifier.indexOf(":");
                 String folderName = itemIdentifier.substring(i + 1);
                 if (itemFolderMap.containsKey(folderName)) {
@@ -533,7 +599,7 @@ public class ItemImportServiceImpl implements ItemImportService, InitializingBea
 
             } else {
 
-                //lookup by meta value
+                // lookup by meta value
                 int i = itemIdentifier.indexOf(":");
                 String metaKey = itemIdentifier.substring(0, i);
                 String metaValue = itemIdentifier.substring(i + 1);
@@ -542,11 +608,11 @@ public class ItemImportServiceImpl implements ItemImportService, InitializingBea
             }
 
         } else if (itemIdentifier.indexOf('/') != -1) {
-            //resolve by handle
+            // resolve by handle
             return (Item) handleService.resolveToObject(c, itemIdentifier);
 
         } else {
-            //try to resolve by UUID
+            // try to resolve by UUID
             return itemService.findByIdOrLegacyId(c, itemIdentifier);
         }
 
@@ -569,7 +635,7 @@ public class ItemImportServiceImpl implements ItemImportService, InitializingBea
         String mf[] = metaKey.split("\\.");
         if (mf.length < 2) {
             throw new Exception("Bad metadata field in reference: '" + metaKey +
-                "' (expected syntax is schema.element[.qualifier])");
+                    "' (expected syntax is schema.element[.qualifier])");
         }
         String schema = mf[0];
         String element = mf[1];
@@ -599,13 +665,13 @@ public class ItemImportServiceImpl implements ItemImportService, InitializingBea
 
     @Override
     public void replaceItems(Context c, List<Collection> mycollections,
-                             String sourceDir, String mapFile, boolean template) throws Exception {
+            String sourceDir, String mapFile, boolean template) throws Exception {
         // verify the source directory
         File d = new java.io.File(sourceDir);
 
         if (d == null || !d.isDirectory()) {
             throw new Exception("Error, cannot open source directory "
-                                    + sourceDir);
+                    + sourceDir);
         }
 
         // read in HashMap first, to get list of handles & source dirs
@@ -629,7 +695,8 @@ public class ItemImportServiceImpl implements ItemImportService, InitializingBea
                 oldItem = itemService.findByIdOrLegacyId(c, oldHandle);
             }
 
-            /* Rather than exposing public item methods to change handles --
+            /*
+             * Rather than exposing public item methods to change handles --
              * two handles can't exist at the same time due to key constraints
              * so would require temp handle being stored, old being copied to new and
              * new being copied to old, all a bit messy -- a handle file is written to
@@ -638,7 +705,8 @@ public class ItemImportServiceImpl implements ItemImportService, InitializingBea
              * had already been assigned a handle (so a new handle is not even assigned).
              * As a commit does not occur until after a successful add, it is safe to
              * do a delete as any error results in an aborted transaction without harming
-             * the original item */
+             * the original item
+             */
             File handleFile = new File(sourceDir + File.separatorChar + newItemName + File.separatorChar + "handle");
             PrintWriter handleOut = new PrintWriter(new FileWriter(handleFile, true));
 
@@ -689,14 +757,16 @@ public class ItemImportServiceImpl implements ItemImportService, InitializingBea
      * @param c             current Context
      * @param mycollections - add item to these Collections.
      * @param path          - directory containing the item directories.
-     * @param itemname      handle - non-null means we have a pre-defined handle already
+     * @param itemname      handle - non-null means we have a pre-defined handle
+     *                      already
      * @param mapOut        - mapfile we're writing
-     * @param template      whether to use collection template item as starting point
+     * @param template      whether to use collection template item as starting
+     *                      point
      * @return Item
      * @throws Exception if error occurs
      */
     protected Item addItem(Context c, List<Collection> mycollections, String path,
-                           String itemname, PrintWriter mapOut, boolean template) throws Exception {
+            String itemname, PrintWriter mapOut, boolean template) throws Exception {
         String mapOutputString = null;
 
         System.out.println("Adding item from directory " + itemname);
@@ -714,13 +784,13 @@ public class ItemImportServiceImpl implements ItemImportService, InitializingBea
 
         // now fill out dublin core for item
         loadMetadata(c, myitem, path + File.separatorChar + itemname
-            + File.separatorChar);
+                + File.separatorChar);
 
         // and the bitstreams from the contents file
         // process contents file, add bistreams and bundles, return any
         // non-standard permissions
         List<String> options = processContentsFile(c, myitem, path
-            + File.separatorChar + itemname, "contents");
+                + File.separatorChar + itemname, "contents");
 
         if (useWorkflow) {
             // don't process handle file
@@ -739,7 +809,7 @@ public class ItemImportServiceImpl implements ItemImportService, InitializingBea
         } else {
             // only process handle file if not using workflow system
             String myhandle = processHandleFile(c, myitem, path
-                + File.separatorChar + itemname, "handle");
+                    + File.separatorChar + itemname, "handle");
 
             // put item in system
             if (!isTest) {
@@ -778,7 +848,7 @@ public class ItemImportServiceImpl implements ItemImportService, InitializingBea
             mapOut.println(mapOutputString);
         }
 
-        //Clear intermediary objects from the cache
+        // Clear intermediary objects from the cache
         c.uncacheEntity(wi);
         c.uncacheEntity(wfi);
 
@@ -862,8 +932,8 @@ public class ItemImportServiceImpl implements ItemImportService, InitializingBea
 
     // Load all metadata schemas into the item.
     protected void loadMetadata(Context c, Item myitem, String path)
-        throws SQLException, IOException, ParserConfigurationException,
-        SAXException, TransformerException, AuthorizeException {
+            throws SQLException, IOException, ParserConfigurationException,
+            SAXException, TransformerException, AuthorizeException, XPathExpressionException {
         // Load the dublin core metadata
         loadDublinCore(c, myitem, path + "dublin_core.xml");
 
@@ -876,17 +946,18 @@ public class ItemImportServiceImpl implements ItemImportService, InitializingBea
     }
 
     protected void loadDublinCore(Context c, Item myitem, String filename)
-        throws SQLException, IOException, ParserConfigurationException,
-        SAXException, TransformerException, AuthorizeException {
+            throws SQLException, IOException, ParserConfigurationException,
+            SAXException, TransformerException, AuthorizeException, XPathExpressionException {
         Document document = loadXML(filename);
 
         // Get the schema, for backward compatibility we will default to the
         // dublin core schema if the schema name is not available in the import
         // file
         String schema;
-        NodeList metadata = XPathAPI.selectNodeList(document, "/dublin_core");
+        XPath xPath = XPathFactory.newInstance().newXPath();
+        NodeList metadata = (NodeList) xPath.compile("/dublin_core").evaluate(document, XPathConstants.NODESET);
         Node schemaAttr = metadata.item(0).getAttributes().getNamedItem(
-            "schema");
+                "schema");
         if (schemaAttr == null) {
             schema = MetadataSchemaEnum.DC.getName();
         } else {
@@ -894,8 +965,7 @@ public class ItemImportServiceImpl implements ItemImportService, InitializingBea
         }
 
         // Get the nodes corresponding to formats
-        NodeList dcNodes = XPathAPI.selectNodeList(document,
-                                                   "/dublin_core/dcvalue");
+        NodeList dcNodes = (NodeList) xPath.compile("/dublin_core/dcvalue").evaluate(document, XPathConstants.NODESET);
 
         if (!isQuiet) {
             System.out.println("\tLoading dublin core from " + filename);
@@ -909,8 +979,8 @@ public class ItemImportServiceImpl implements ItemImportService, InitializingBea
     }
 
     protected void addDCValue(Context c, Item i, String schema, Node n)
-        throws TransformerException, SQLException, AuthorizeException {
-        String value = getStringValue(n); //n.getNodeValue();
+            throws TransformerException, SQLException, AuthorizeException {
+        String value = getStringValue(n); // n.getNodeValue();
         // compensate for empty value getting read as "null", which won't display
         if (value == null) {
             value = "";
@@ -919,7 +989,7 @@ public class ItemImportServiceImpl implements ItemImportService, InitializingBea
         }
         // //getElementData(n, "element");
         String element = getAttributeValue(n, "element");
-        String qualifier = getAttributeValue(n, "qualifier"); //NodeValue();
+        String qualifier = getAttributeValue(n, "qualifier"); // NodeValue();
         // //getElementData(n,
         // "qualifier");
         String language = getAttributeValue(n, "language");
@@ -929,7 +999,7 @@ public class ItemImportServiceImpl implements ItemImportService, InitializingBea
 
         if (!isQuiet) {
             System.out.println("\tSchema: " + schema + " Element: " + element + " Qualifier: " + qualifier
-                                   + " Value: " + value);
+                    + " Value: " + value);
         }
 
         if ("none".equals(qualifier) || "".equals(qualifier)) {
@@ -939,7 +1009,8 @@ public class ItemImportServiceImpl implements ItemImportService, InitializingBea
         if (!isTest && !value.equals("")) {
             itemService.addMetadata(c, i, schema, element, qualifier, language, value);
         } else {
-            // If we're just test the import, let's check that the actual metadata field exists.
+            // If we're just test the import, let's check that the actual metadata field
+            // exists.
             MetadataSchema foundSchema = metadataSchemaService.find(c, schema);
 
             if (foundSchema == null) {
@@ -951,8 +1022,9 @@ public class ItemImportServiceImpl implements ItemImportService, InitializingBea
 
             if (foundField == null) {
                 System.out.println(
-                    "ERROR: Metadata field: '" + schema + "." + element + "." + qualifier + "' was not found in the " +
-                        "registry.");
+                        "ERROR: Metadata field: '" + schema + "." + element + "." + qualifier
+                                + "' was not found in the " +
+                                "registry.");
                 return;
             }
         }
@@ -973,7 +1045,7 @@ public class ItemImportServiceImpl implements ItemImportService, InitializingBea
      */
 
     protected List<Collection> processCollectionFile(Context c, String path, String filename)
-        throws IOException, SQLException {
+            throws IOException, SQLException {
         File file = new File(path + File.separatorChar + filename);
         ArrayList<Collection> collections = new ArrayList<>();
         List<Collection> result = null;
@@ -1081,8 +1153,8 @@ public class ItemImportServiceImpl implements ItemImportService, InitializingBea
      * @throws AuthorizeException if authorization error
      */
     protected List<String> processContentsFile(Context c, Item i, String path,
-                                               String filename) throws SQLException, IOException,
-        AuthorizeException {
+            String filename) throws SQLException, IOException,
+            AuthorizeException {
         File contentsFile = new File(path + File.separatorChar + filename);
         String line = "";
         List<String> options = new ArrayList<>();
@@ -1099,16 +1171,16 @@ public class ItemImportServiceImpl implements ItemImportService, InitializingBea
                         continue;
                     }
 
-                    //  1) registered into dspace (leading -r)
-                    //  2) imported conventionally into dspace (no -r)
+                    // 1) registered into dspace (leading -r)
+                    // 2) imported conventionally into dspace (no -r)
                     if (line.trim().startsWith("-r ")) {
                         // line should be one of these two:
                         // -r -s n -f filepath
                         // -r -s n -f filepath\tbundle:bundlename
                         // where
-                        //    n is the assetstore number
-                        //    filepath is the path of the file to be registered
-                        //    bundlename is an optional bundle name
+                        // n is the assetstore number
+                        // filepath is the path of the file to be registered
+                        // bundlename is an optional bundle name
                         String sRegistrationLine = line.trim();
                         int iAssetstore = -1;
                         String sFilePath = null;
@@ -1120,8 +1192,7 @@ public class ItemImportServiceImpl implements ItemImportService, InitializingBea
                                 continue;
                             } else if ("-s".equals(sToken) && tokenizer.hasMoreTokens()) {
                                 try {
-                                    iAssetstore =
-                                        Integer.parseInt(tokenizer.nextToken());
+                                    iAssetstore = Integer.parseInt(tokenizer.nextToken());
                                 } catch (NumberFormatException e) {
                                     // ignore - iAssetstore remains -1
                                 }
@@ -1136,7 +1207,7 @@ public class ItemImportServiceImpl implements ItemImportService, InitializingBea
                         if (iAssetstore == -1 || sFilePath == null) {
                             System.out.println("\tERROR: invalid contents file line");
                             System.out.println("\t\tSkipping line: "
-                                + sRegistrationLine);
+                                    + sRegistrationLine);
                             continue;
                         }
 
@@ -1160,10 +1231,10 @@ public class ItemImportServiceImpl implements ItemImportService, InitializingBea
 
                         registerBitstream(c, i, iAssetstore, sFilePath, sBundle, sDescription);
                         System.out.println("\tRegistering Bitstream: " + sFilePath
-                            + "\tAssetstore: " + iAssetstore
-                            + "\tBundle: " + sBundle
-                            + "\tDescription: " + sDescription);
-                        continue;                // process next line in contents file
+                                + "\tAssetstore: " + iAssetstore
+                                + "\tBundle: " + sBundle
+                                + "\tDescription: " + sDescription);
+                        continue; // process next line in contents file
                     }
 
                     int bitstreamEndIndex = line.indexOf('\t');
@@ -1232,7 +1303,6 @@ public class ItemImportServiceImpl implements ItemImportService, InitializingBea
                             tocExists = true;
                         }
 
-
                         // look for a bundle name
                         String bundleMarker = "\tbundle:";
                         int bMarkerIndex = line.indexOf(bundleMarker);
@@ -1280,50 +1350,50 @@ public class ItemImportServiceImpl implements ItemImportService, InitializingBea
 
                         if (bundleExists) {
                             String bundleName = line.substring(bMarkerIndex
-                                + bundleMarker.length(), bEndIndex).trim();
+                                    + bundleMarker.length(), bEndIndex).trim();
 
                             processContentFileEntry(c, i, path, bitstreamName, bundleName, primary);
                             System.out.println("\tBitstream: " + bitstreamName +
-                                "\tBundle: " + bundleName +
-                                primaryStr);
+                                    "\tBundle: " + bundleName +
+                                    primaryStr);
                         } else {
                             processContentFileEntry(c, i, path, bitstreamName, null, primary);
                             System.out.println("\tBitstream: " + bitstreamName + primaryStr);
                         }
 
                         if (permissionsExist || descriptionExists || labelExists || heightExists
-                            || widthExists || tocExists) {
+                                || widthExists || tocExists) {
                             System.out.println("Gathering options.");
                             String extraInfo = bitstreamName;
 
                             if (permissionsExist) {
                                 extraInfo = extraInfo
-                                    + line.substring(pMarkerIndex, pEndIndex);
+                                        + line.substring(pMarkerIndex, pEndIndex);
                             }
 
                             if (descriptionExists) {
                                 extraInfo = extraInfo
-                                    + line.substring(dMarkerIndex, dEndIndex);
+                                        + line.substring(dMarkerIndex, dEndIndex);
                             }
 
                             if (labelExists) {
                                 extraInfo = extraInfo
-                                    + line.substring(lMarkerIndex, lEndIndex);
+                                        + line.substring(lMarkerIndex, lEndIndex);
                             }
 
                             if (heightExists) {
                                 extraInfo = extraInfo
-                                    + line.substring(hMarkerIndex, hEndIndex);
+                                        + line.substring(hMarkerIndex, hEndIndex);
                             }
 
                             if (widthExists) {
                                 extraInfo = extraInfo
-                                    + line.substring(wMarkerIndex, wEndIndex);
+                                        + line.substring(wMarkerIndex, wEndIndex);
                             }
 
                             if (tocExists) {
                                 extraInfo = extraInfo
-                                    + line.substring(tMarkerIndex, tEndIndex);
+                                        + line.substring(tMarkerIndex, tEndIndex);
                             }
 
                             options.add(extraInfo);
@@ -1340,7 +1410,7 @@ public class ItemImportServiceImpl implements ItemImportService, InitializingBea
             String[] dirListing = dir.list();
             for (String fileName : dirListing) {
                 if (!"dublin_core.xml".equals(fileName) && !fileName.equals("handle") && !metadataFileFilter
-                    .accept(dir, fileName)) {
+                        .accept(dir, fileName)) {
                     throw new FileNotFoundException("No contents file found");
                 }
             }
@@ -1365,13 +1435,13 @@ public class ItemImportServiceImpl implements ItemImportService, InitializingBea
      * @throws AuthorizeException if authorization error
      */
     protected void processContentFileEntry(Context c, Item i, String path,
-                                           String fileName, String bundleName, boolean primary) throws SQLException,
-        IOException, AuthorizeException {
+            String fileName, String bundleName, boolean primary) throws SQLException,
+            IOException, AuthorizeException {
         String fullpath = path + File.separatorChar + fileName;
 
         // get an input stream
         BufferedInputStream bis = new BufferedInputStream(new FileInputStream(
-            fullpath));
+                fullpath));
 
         Bitstream bs = null;
         String newBundleName = bundleName;
@@ -1436,8 +1506,8 @@ public class ItemImportServiceImpl implements ItemImportService, InitializingBea
      * @throws AuthorizeException if authorization error
      */
     protected void registerBitstream(Context c, Item i, int assetstore,
-                                     String bitstreamPath, String bundleName, String description)
-        throws SQLException, IOException, AuthorizeException {
+            String bitstreamPath, String bundleName, String description)
+            throws SQLException, IOException, AuthorizeException {
         // TODO validate assetstore number
         // TODO make sure the bitstream is there
 
@@ -1475,7 +1545,8 @@ public class ItemImportServiceImpl implements ItemImportService, InitializingBea
             bs.setName(c, bitstreamPath.substring(iLastSlash + 1));
 
             // Identify the format
-            // FIXME - guessing format guesses license.txt incorrectly as a text file format!
+            // FIXME - guessing format guesses license.txt incorrectly as a text file
+            // format!
             BitstreamFormat bf = bitstreamFormatService.guessFormat(c, bs);
             bitstreamService.setFormat(c, bs, bf);
             bs.setDescription(c, description);
@@ -1506,7 +1577,7 @@ public class ItemImportServiceImpl implements ItemImportService, InitializingBea
      * @throws AuthorizeException if authorization error
      */
     protected void processOptions(Context c, Item myItem, List<String> options)
-        throws SQLException, AuthorizeException {
+            throws SQLException, AuthorizeException {
         System.out.println("Processing options.");
         for (String line : options) {
             System.out.println("\tprocessing " + line);
@@ -1539,7 +1610,6 @@ public class ItemImportServiceImpl implements ItemImportService, InitializingBea
                 }
                 descriptionExists = true;
             }
-
 
             // look for label
             String labelMarker = "\tiiif-label:";
@@ -1589,7 +1659,6 @@ public class ItemImportServiceImpl implements ItemImportService, InitializingBea
                 tocExists = true;
             }
 
-
             int bsEndIndex = line.indexOf("\t");
             String bitstreamName = line.substring(0, bsEndIndex);
 
@@ -1598,7 +1667,7 @@ public class ItemImportServiceImpl implements ItemImportService, InitializingBea
             Group myGroup = null;
             if (permissionsExist) {
                 String thisPermission = line.substring(pMarkerIndex
-                    + permissionsMarker.length(), pEndIndex);
+                        + permissionsMarker.length(), pEndIndex);
 
                 // get permission type ("read" or "write")
                 int pTypeIndex = thisPermission.indexOf('-');
@@ -1615,7 +1684,7 @@ public class ItemImportServiceImpl implements ItemImportService, InitializingBea
                 }
 
                 groupName = thisPermission.substring(groupIndex + 1,
-                    groupEndIndex);
+                        groupEndIndex);
 
                 if (thisPermission.toLowerCase().charAt(pTypeIndex + 1) == 'r') {
                     actionID = Constants.READ;
@@ -1627,7 +1696,7 @@ public class ItemImportServiceImpl implements ItemImportService, InitializingBea
                     myGroup = groupService.findByName(c, groupName);
                 } catch (SQLException sqle) {
                     System.out.println("SQL Exception finding group name: "
-                        + groupName);
+                            + groupName);
                     // do nothing, will check for null group later
                 }
             }
@@ -1635,36 +1704,36 @@ public class ItemImportServiceImpl implements ItemImportService, InitializingBea
             String thisDescription = "";
             if (descriptionExists) {
                 thisDescription = line.substring(
-                                          dMarkerIndex + descriptionMarker.length(), dEndIndex)
-                                      .trim();
+                        dMarkerIndex + descriptionMarker.length(), dEndIndex)
+                        .trim();
             }
 
             String thisLabel = "";
             if (labelExists) {
                 thisLabel = line.substring(
-                                    lMarkerIndex + labelMarker.length(), lEndIndex)
-                                .trim();
+                        lMarkerIndex + labelMarker.length(), lEndIndex)
+                        .trim();
             }
 
             String thisHeight = "";
             if (heightExists) {
                 thisHeight = line.substring(
-                                     hMarkerIndex + heightMarker.length(), hEndIndex)
-                                 .trim();
+                        hMarkerIndex + heightMarker.length(), hEndIndex)
+                        .trim();
             }
 
             String thisWidth = "";
             if (widthExists) {
                 thisWidth = line.substring(
-                                    wMarkerIndex + widthMarker.length(), wEndIndex)
-                                .trim();
+                        wMarkerIndex + widthMarker.length(), wEndIndex)
+                        .trim();
             }
 
             String thisToc = "";
             if (tocExists) {
                 thisToc = line.substring(
-                                  tMarkerIndex + tocMarker.length(), tEndIndex)
-                              .trim();
+                        tMarkerIndex + tocMarker.length(), tEndIndex)
+                        .trim();
             }
 
             Bitstream bs = null;
@@ -1685,61 +1754,61 @@ public class ItemImportServiceImpl implements ItemImportService, InitializingBea
             if (notfound && !isTest) {
                 // this should never happen
                 System.out.println("\tdefault permissions set for "
-                    + bitstreamName);
+                        + bitstreamName);
             } else if (!isTest) {
                 if (permissionsExist) {
                     if (myGroup == null) {
                         System.out.println("\t" + groupName
-                            + " not found, permissions set to default");
+                                + " not found, permissions set to default");
                     } else if (actionID == -1) {
                         System.out
-                            .println("\tinvalid permissions flag, permissions set to default");
+                                .println("\tinvalid permissions flag, permissions set to default");
                     } else {
                         System.out.println("\tSetting special permissions for "
-                            + bitstreamName);
+                                + bitstreamName);
                         setPermission(c, myGroup, actionID, bs);
                     }
                 }
 
                 if (descriptionExists) {
                     System.out.println("\tSetting description for "
-                        + bitstreamName);
+                            + bitstreamName);
                     bs.setDescription(c, thisDescription);
                     updateRequired = true;
                 }
 
                 if (labelExists) {
                     MetadataField metadataField = metadataFieldService
-                        .findByElement(c, METADATA_IIIF_SCHEMA, METADATA_IIIF_LABEL_ELEMENT, null);
+                            .findByElement(c, METADATA_IIIF_SCHEMA, METADATA_IIIF_LABEL_ELEMENT, null);
                     System.out.println("\tSetting label to " + thisLabel + " in element "
-                        + metadataField.getElement() + " on " + bitstreamName);
+                            + metadataField.getElement() + " on " + bitstreamName);
                     bitstreamService.addMetadata(c, bs, metadataField, null, thisLabel);
                     updateRequired = true;
                 }
 
                 if (heightExists) {
                     MetadataField metadataField = metadataFieldService
-                        .findByElement(c, METADATA_IIIF_SCHEMA, METADATA_IIIF_IMAGE_ELEMENT,
-                            METADATA_IIIF_HEIGHT_QUALIFIER);
+                            .findByElement(c, METADATA_IIIF_SCHEMA, METADATA_IIIF_IMAGE_ELEMENT,
+                                    METADATA_IIIF_HEIGHT_QUALIFIER);
                     System.out.println("\tSetting height to " + thisHeight + " in element "
-                        + metadataField.getElement() + " on " + bitstreamName);
+                            + metadataField.getElement() + " on " + bitstreamName);
                     bitstreamService.addMetadata(c, bs, metadataField, null, thisHeight);
                     updateRequired = true;
                 }
                 if (widthExists) {
                     MetadataField metadataField = metadataFieldService
-                        .findByElement(c, METADATA_IIIF_SCHEMA, METADATA_IIIF_IMAGE_ELEMENT,
-                            METADATA_IIIF_WIDTH_QUALIFIER);
+                            .findByElement(c, METADATA_IIIF_SCHEMA, METADATA_IIIF_IMAGE_ELEMENT,
+                                    METADATA_IIIF_WIDTH_QUALIFIER);
                     System.out.println("\tSetting width to " + thisWidth + " in element "
-                        + metadataField.getElement() + " on " + bitstreamName);
+                            + metadataField.getElement() + " on " + bitstreamName);
                     bitstreamService.addMetadata(c, bs, metadataField, null, thisWidth);
                     updateRequired = true;
                 }
                 if (tocExists) {
                     MetadataField metadataField = metadataFieldService
-                        .findByElement(c, METADATA_IIIF_SCHEMA, METADATA_IIIF_TOC_ELEMENT, null);
+                            .findByElement(c, METADATA_IIIF_SCHEMA, METADATA_IIIF_TOC_ELEMENT, null);
                     System.out.println("\tSetting toc to " + thisToc + " in element "
-                        + metadataField.getElement() + " on " + bitstreamName);
+                            + metadataField.getElement() + " on " + bitstreamName);
                     bitstreamService.addMetadata(c, bs, metadataField, null, thisToc);
                     updateRequired = true;
                 }
@@ -1762,7 +1831,7 @@ public class ItemImportServiceImpl implements ItemImportService, InitializingBea
      * @see org.dspace.core.Constants
      */
     protected void setPermission(Context c, Group g, int actionID, Bitstream bs)
-        throws SQLException, AuthorizeException {
+            throws SQLException, AuthorizeException {
         if (!isTest) {
             // remove the default policy
             authorizeService.removeAllPolicies(c, bs);
@@ -1808,7 +1877,6 @@ public class ItemImportServiceImpl implements ItemImportService, InitializingBea
         return "";
     }
 
-
     /**
      * Return the String value of a Node.
      *
@@ -1839,9 +1907,9 @@ public class ItemImportServiceImpl implements ItemImportService, InitializingBea
      * @throws SAXException                 if XML error
      */
     protected Document loadXML(String filename) throws IOException,
-        ParserConfigurationException, SAXException {
+            ParserConfigurationException, SAXException {
         DocumentBuilder builder = DocumentBuilderFactory.newInstance()
-                                                        .newDocumentBuilder();
+                .newDocumentBuilder();
 
         return builder.parse(new File(filename));
     }
@@ -1891,8 +1959,8 @@ public class ItemImportServiceImpl implements ItemImportService, InitializingBea
         File tempdir = new File(destinationDir);
         if (!tempdir.isDirectory()) {
             log.error("'" + configurationService.getProperty("org.dspace.app.itemexport.work.dir") +
-                          "' as defined by the key 'org.dspace.app.itemexport.work.dir' in dspace.cfg " +
-                          "is not a valid directory");
+                    "' as defined by the key 'org.dspace.app.itemexport.work.dir' in dspace.cfg " +
+                    "is not a valid directory");
         }
 
         if (!tempdir.exists() && !tempdir.mkdirs()) {
@@ -1900,8 +1968,7 @@ public class ItemImportServiceImpl implements ItemImportService, InitializingBea
         }
         String sourcedir = destinationDir + System.getProperty("file.separator") + zipfile.getName();
         String zipDir = destinationDir + System.getProperty("file.separator") + zipfile.getName() + System
-            .getProperty("file.separator");
-
+                .getProperty("file.separator");
 
         // 3
         String sourceDirForZip = sourcedir;
@@ -1917,11 +1984,12 @@ public class ItemImportServiceImpl implements ItemImportService, InitializingBea
             } else {
                 String entryName = entry.getName();
                 File outFile = new File(zipDir + entryName);
-                // Verify that this file will be extracted into our zipDir (and not somewhere else!)
+                // Verify that this file will be extracted into our zipDir (and not somewhere
+                // else!)
                 if (!outFile.toPath().normalize().startsWith(zipDir)) {
                     throw new IOException("Bad zip entry: '" + entryName
-                                              + "' in file '" + zipfile.getAbsolutePath() + "'!"
-                                              + " Cannot process this file.");
+                            + "' in file '" + zipfile.getAbsolutePath() + "'!"
+                            + " Cannot process this file.");
                 } else {
                     System.out.println("Extracting file: " + entryName);
                     log.info("Extracting file: " + entryName);
@@ -1937,14 +2005,14 @@ public class ItemImportServiceImpl implements ItemImportService, InitializingBea
                             log.error("Unable to create directory: " + dir.getAbsolutePath());
                         }
 
-                        //Entries could have too many directories, and we need to adjust the sourcedir
+                        // Entries could have too many directories, and we need to adjust the sourcedir
                         // file1.zip (SimpleArchiveFormat / item1 / contents|dublin_core|...
-                        //            SimpleArchiveFormat / item2 / contents|dublin_core|...
+                        // SimpleArchiveFormat / item2 / contents|dublin_core|...
                         // or
                         // file2.zip (item1 / contents|dublin_core|...
-                        //            item2 / contents|dublin_core|...
+                        // item2 / contents|dublin_core|...
 
-                        //regex supports either windows or *nix file paths
+                        // regex supports either windows or *nix file paths
                         String[] entryChunks = entryName.split("/|\\\\");
                         if (entryChunks.length > 2) {
                             if (StringUtils.equals(sourceDirForZip, sourcedir)) {
@@ -1956,7 +2024,7 @@ public class ItemImportServiceImpl implements ItemImportService, InitializingBea
                     int len;
                     InputStream in = zf.getInputStream(entry);
                     BufferedOutputStream out = new BufferedOutputStream(
-                        new FileOutputStream(outFile));
+                            new FileOutputStream(outFile));
                     while ((len = in.read(buffer)) >= 0) {
                         out.write(buffer, 0, len);
                     }
@@ -1966,7 +2034,7 @@ public class ItemImportServiceImpl implements ItemImportService, InitializingBea
             }
         }
 
-        //Close zip file
+        // Close zip file
         zf.close();
 
         if (!StringUtils.equals(sourceDirForZip, sourcedir)) {
@@ -2000,22 +2068,27 @@ public class ItemImportServiceImpl implements ItemImportService, InitializingBea
     }
 
     /**
-     * Given a local file or public URL to a zip file that has the Simple Archive Format, this method imports the
+     * Given a local file or public URL to a zip file that has the Simple Archive
+     * Format, this method imports the
      * contents to DSpace
      *
-     * @param filepath         The filepath to local file or the public URL of the zip file
+     * @param filepath         The filepath to local file or the public URL of the
+     *                         zip file
      * @param owningCollection The owning collection the items will belong to
-     * @param otherCollections The collections the created items will be inserted to, apart from the owning one
-     * @param resumeDir        In case of a resume request, the directory that containsthe old mapfile and data
-     * @param inputType        The input type of the data (bibtex, csv, etc.), in case of local file
+     * @param otherCollections The collections the created items will be inserted
+     *                         to, apart from the owning one
+     * @param resumeDir        In case of a resume request, the directory that
+     *                         containsthe old mapfile and data
+     * @param inputType        The input type of the data (bibtex, csv, etc.), in
+     *                         case of local file
      * @param context          The context
      * @param template         whether to use template item
      * @throws Exception if error
      */
     @Override
     public void processUIImport(String filepath, Collection owningCollection, String[] otherCollections,
-                                String resumeDir, String inputType, Context context, final boolean template)
-        throws Exception {
+            String resumeDir, String inputType, Context context, final boolean template)
+            throws Exception {
         final EPerson oldEPerson = context.getCurrentUser();
         final String[] theOtherCollections = otherCollections;
         final Collection theOwningCollection = owningCollection;
@@ -2056,11 +2129,14 @@ public class ItemImportServiceImpl implements ItemImportService, InitializingBea
                     }
 
                     importDir = configurationService.getProperty(
-                        "org.dspace.app.batchitemimport.work.dir") + File.separator + "batchuploads" + File.separator
-                        + context
-                        .getCurrentUser()
-                        .getID() + File.separator + (isResume ? theResumeDir : (new GregorianCalendar())
-                        .getTimeInMillis());
+                            "org.dspace.app.batchitemimport.work.dir") + File.separator + "batchuploads"
+                            + File.separator
+                            + context
+                                    .getCurrentUser()
+                                    .getID()
+                            + File.separator + (isResume ? theResumeDir
+                                    : (new GregorianCalendar())
+                                            .getTimeInMillis());
                     File importDirFile = new File(importDir);
                     if (!importDirFile.exists()) {
                         boolean success = importDirFile.mkdirs();
@@ -2073,11 +2149,11 @@ public class ItemImportServiceImpl implements ItemImportService, InitializingBea
                     String dataPath = null;
                     String dataDir = null;
 
-                    if (theInputType.equals("saf")) { //In case of Simple Archive Format import (from remote url)
+                    if (theInputType.equals("saf")) { // In case of Simple Archive Format import (from remote url)
                         dataPath = importDirFile + File.separator + "data.zip";
                         dataDir = importDirFile + File.separator + "data_unzipped2" + File.separator;
                     } else if (theInputType
-                        .equals("safupload")) { //In case of Simple Archive Format import (from upload file)
+                            .equals("safupload")) { // In case of Simple Archive Format import (from upload file)
                         FileUtils.copyFileToDirectory(new File(theFilePath), importDirFile);
                         dataPath = importDirFile + File.separator + (new File(theFilePath)).getName();
                         dataDir = importDirFile + File.separator + "data_unzipped2" + File.separator;
@@ -2086,7 +2162,7 @@ public class ItemImportServiceImpl implements ItemImportService, InitializingBea
                         dataDir = importDirFile + File.separator + "data" + File.separator;
                     }
 
-                    //Clear these files, if a resume
+                    // Clear these files, if a resume
                     if (isResume) {
                         if (!theInputType.equals("safupload")) {
                             (new File(dataPath)).delete();
@@ -2094,10 +2170,11 @@ public class ItemImportServiceImpl implements ItemImportService, InitializingBea
                         (new File(importDirFile + File.separator + "error.txt")).delete();
                         FileDeleteStrategy.FORCE.delete(new File(dataDir));
                         FileDeleteStrategy.FORCE
-                            .delete(new File(importDirFile + File.separator + "data_unzipped" + File.separator));
+                                .delete(new File(importDirFile + File.separator + "data_unzipped" + File.separator));
                     }
 
-                    //In case of Simple Archive Format import we need an extra effort to download the zip file and
+                    // In case of Simple Archive Format import we need an extra effort to download
+                    // the zip file and
                     // unzip it
                     String sourcePath = null;
                     if (theInputType.equals("saf")) {
@@ -2116,21 +2193,21 @@ public class ItemImportServiceImpl implements ItemImportService, InitializingBea
 
                         sourcePath = unzip(new File(dataPath), dataDir);
 
-                        //Move files to the required folder
+                        // Move files to the required folder
                         FileUtils.moveDirectory(new File(sourcePath), new File(
-                            importDirFile + File.separator + "data_unzipped" + File.separator));
+                                importDirFile + File.separator + "data_unzipped" + File.separator));
                         FileDeleteStrategy.FORCE.delete(new File(dataDir));
                         dataDir = importDirFile + File.separator + "data_unzipped" + File.separator;
                     } else if (theInputType.equals("safupload")) {
                         sourcePath = unzip(new File(dataPath), dataDir);
-                        //Move files to the required folder
+                        // Move files to the required folder
                         FileUtils.moveDirectory(new File(sourcePath), new File(
-                            importDirFile + File.separator + "data_unzipped" + File.separator));
+                                importDirFile + File.separator + "data_unzipped" + File.separator));
                         FileDeleteStrategy.FORCE.delete(new File(dataDir));
                         dataDir = importDirFile + File.separator + "data_unzipped" + File.separator;
                     }
 
-                    //Create mapfile path
+                    // Create mapfile path
                     String mapFilePath = importDirFile + File.separator + "mapfile";
 
                     List<Collection> finalCollections = null;
@@ -2143,7 +2220,7 @@ public class ItemImportServiceImpl implements ItemImportService, InitializingBea
                     setResume(isResume);
 
                     if (theInputType.equals("saf") || theInputType
-                        .equals("safupload")) { //In case of Simple Archive Format import
+                            .equals("safupload")) { // In case of Simple Archive Format import
                         addItems(context, finalCollections, dataDir, mapFilePath, template);
                     }
 
@@ -2188,7 +2265,7 @@ public class ItemImportServiceImpl implements ItemImportService, InitializingBea
 
     @Override
     public void emailSuccessMessage(Context context, EPerson eperson,
-                                    String fileName) throws MessagingException {
+            String fileName) throws MessagingException {
         try {
             Locale supportedLocale = I18nUtil.getEPersonLocale(eperson);
             Email email = Email.getEmail(I18nUtil.getEmailFilename(supportedLocale, "bte_batch_import_success"));
@@ -2203,7 +2280,7 @@ public class ItemImportServiceImpl implements ItemImportService, InitializingBea
 
     @Override
     public void emailErrorMessage(EPerson eperson, String error)
-        throws MessagingException {
+            throws MessagingException {
         log.warn("An error occurred during item import, the user will be notified. " + error);
         try {
             Locale supportedLocale = I18nUtil.getEPersonLocale(eperson);
@@ -2220,7 +2297,7 @@ public class ItemImportServiceImpl implements ItemImportService, InitializingBea
 
     @Override
     public List<BatchUpload> getImportsAvailable(EPerson eperson)
-        throws Exception {
+            throws Exception {
         File uploadDir = new File(getImportUploadableDirectory(eperson));
         if (!uploadDir.exists() || !uploadDir.isDirectory()) {
             return null;
@@ -2247,14 +2324,14 @@ public class ItemImportServiceImpl implements ItemImportService, InitializingBea
 
     @Override
     public String getImportUploadableDirectory(EPerson ePerson)
-        throws Exception {
+            throws Exception {
         String uploadDir = configurationService.getProperty("org.dspace.app.batchitemimport.work.dir");
         if (uploadDir == null) {
             throw new Exception(
-                "A dspace.cfg entry for 'org.dspace.app.batchitemimport.work.dir' does not exist.");
+                    "A dspace.cfg entry for 'org.dspace.app.batchitemimport.work.dir' does not exist.");
         }
         String uploadDirBasePath = uploadDir + File.separator + "batchuploads" + File.separator;
-        //Check for backwards compatibility with the old identifier
+        // Check for backwards compatibility with the old identifier
         File uploadDirectory = new File(uploadDirBasePath + ePerson.getLegacyId());
         if (!uploadDirectory.exists()) {
             uploadDirectory = new File(uploadDirBasePath + ePerson.getID());
@@ -2283,14 +2360,14 @@ public class ItemImportServiceImpl implements ItemImportService, InitializingBea
 
     @Override
     public File getTempWorkDirFile()
-        throws IOException {
+            throws IOException {
         File tempDirFile = new File(getTempWorkDir());
         if (!tempDirFile.exists()) {
             boolean success = tempDirFile.mkdirs();
             if (!success) {
                 throw new IOException("Work directory "
-                                          + tempDirFile.getAbsolutePath()
-                                          + " could not be created.");
+                        + tempDirFile.getAbsolutePath()
+                        + " could not be created.");
             } else {
                 log.debug("Created directory " + tempDirFile.getAbsolutePath());
             }

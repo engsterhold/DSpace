@@ -54,7 +54,7 @@ import org.dspace.storage.safstore.service.SAFItemImportService;
  * Modified by David Little, UCSD Libraries 12/21/04 to
  * allow the registration of files (bitstreams) into DSpace.
  */
-public class ItemImportCLITool2 {
+public class ItemRegisterCLITool {
 
     private static boolean template = false;
 
@@ -66,7 +66,7 @@ public class ItemImportCLITool2 {
     /**
      * Default constructor
      */
-    private ItemImportCLITool2() {
+    private ItemRegisterCLITool() {
     }
 
     public static void main(String[] argv) throws Exception {

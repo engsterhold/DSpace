@@ -32,6 +32,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.test
+      target: build
     depends_on:
     - dspacedb
     networks:
@@ -48,7 +49,6 @@ services:
     - assetstore:/dspace/assetstore
     - ./_saf_store:/dspace/_saf_store
     - ./_logs:/dspace/log
-    - ./imports:/dspace/imports
     # Mount local [src]/dspace/config/ to container. This syncs your local configs with container
     # NOTE: Environment variables specified above will OVERRIDE any configs in local.cfg or dspace.cfg
     - ./dspace/config:/dspace/config
@@ -118,6 +118,31 @@ services:
       precreate-core statistics /opt/solr/server/solr/configsets/statistics
       cp -r -u /opt/solr/server/solr/configsets/statistics/* statistics
       exec solr -f
+  #angular frontend
+  dspace-angular:
+    container_name: dspace-angular
+    depends_on:
+    - dspace
+    environment:
+      DSPACE_UI_SSL: 'false'
+      DSPACE_UI_HOST: dspace-angular
+      DSPACE_UI_PORT: '4000'
+      DSPACE_UI_NAMESPACE: /
+      DSPACE_REST_SSL: 'false'
+      DSPACE_REST_HOST: localhost
+      DSPACE_REST_PORT: 8080
+      DSPACE_REST_NAMESPACE: /server
+    image: dspace/dspace-angular:dspace-7_x
+    networks:
+      dspacenet:
+    ports:
+    - published: 4000
+      target: 4000
+    - published: 9876
+      target: 9876
+    stdin_open: true
+    tty: true
+
 volumes:
   assetstore:
   pgdata:

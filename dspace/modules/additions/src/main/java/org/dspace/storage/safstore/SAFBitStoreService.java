@@ -72,6 +72,8 @@ public class SAFBitStoreService implements BitStoreService {
         // the config string contains just the asset store directory path
         // set baseDir?
         log.info("SAFBitStore init!!!");
+        log.info("SAFStore base Dir: " + baseDir);
+
     }
 
     /**

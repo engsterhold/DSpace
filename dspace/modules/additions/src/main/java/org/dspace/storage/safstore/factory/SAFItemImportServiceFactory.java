@@ -7,10 +7,10 @@
  */
 package org.dspace.storage.safstore.factory;
 
-import org.dspace.app.itemimport.factory.ItemImportServiceFactory;
 import org.dspace.app.itemimport.service.ItemImportService;
 import org.dspace.services.factory.DSpaceServicesFactory;
-import org.dspace.storage.safstore.ItemImportServiceImpl2;
+import org.dspace.storage.safstore.SAFItemImportServiceImpl;
+import org.dspace.storage.safstore.service.SAFItemImportService;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Qualifier;
 
@@ -21,19 +21,17 @@ import org.springframework.beans.factory.annotation.Qualifier;
  *
  * @author kevinvandevelde at atmire.com
  */
-public class ItemImportServiceFactory2 extends ItemImportServiceFactory {
+public class SAFItemImportServiceFactory {
 
     @Autowired(required = true)
-    @Qualifier("itemImportService2")
-    private ItemImportServiceImpl2 itemImportService2;
+    private SAFItemImportService safimport;
 
-    @Override
-    public ItemImportService getItemImportService() {
-        return itemImportService2;
+    public SAFItemImportService getSafImportService() {
+        return safimport;
     }
 
-    public static ItemImportServiceFactory2 getInstance() {
+    public static SAFItemImportServiceFactory getInstance() {
         return DSpaceServicesFactory.getInstance().getServiceManager()
-                .getServiceByName(null, ItemImportServiceFactory2.class);
+                .getServiceByName(null, SAFItemImportServiceFactory.class);
     }
 }

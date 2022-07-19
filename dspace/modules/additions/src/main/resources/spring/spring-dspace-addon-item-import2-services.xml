@@ -15,11 +15,20 @@
            http://www.springframework.org/schema/beans/spring-beans-2.5.xsd
            http://www.springframework.org/schema/context
            http://www.springframework.org/schema/context/spring-context-2.5.xsd"
-    default-autowire-candidates="*Service,*DAO,javax.sql.DataSource" default-lazy-init="true">
+   default-lazy-init="true">
 
     <context:annotation-config /> <!-- allows us to use spring annotations in beans -->
 
-    <bean id="itemImportService2" class="org.dspace.storage.safstore.ItemImportServiceImpl2"  scope="prototype"/>
+    <bean id="safimport" class="org.dspace.storage.safstore.SAFItemImportServiceImpl"  scope="prototype"/>
+    <bean class="org.dspace.storage.safstore.service.SAFItemImportService"/>
+    <bean class="org.dspace.storage.safstore.factory.SAFItemImportServiceFactory"/>
+    <bean class="org.dspace.storage.safstore.ItemImportCLITool2" />
+    <bean id="safexport" class="org.dspace.storage.safstore.SAFItemExportServiceImpl" />
+    <bean class="org.dspace.storage.safstore.service.SAFItemExportService"/>
+    <bean class="org.dspace.storage.safstore.factory.SAFItemExportServiceFactory"/>
+    <bean class="org.dspace.storage.safstore.ItemExportCLITool2" />
+    <bean id="itemChangeEventConsumer" class="org.dspace.storage.safstore.SAFBitStoreEventConsumer" />
+    
 
 </beans>
 

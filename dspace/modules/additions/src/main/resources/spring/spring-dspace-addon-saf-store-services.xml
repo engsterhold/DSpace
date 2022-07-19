@@ -15,10 +15,19 @@
            http://www.springframework.org/schema/beans/spring-beans-2.5.xsd
            http://www.springframework.org/schema/context
            http://www.springframework.org/schema/context/spring-context-2.5.xsd"
-    default-autowire-candidates="*Service,*DAO,javax.sql.DataSource">
+   default-lazy-init="true">
 
     <context:annotation-config /> <!-- allows us to use spring annotations in beans -->
 
-    <bean id="itemChangeEventConsumer" class="org.dspace.storage.safstore.SAFBitStoreEventConsumer" />
+    
+    <bean class="org.dspace.storage.safstore.service.SAFItemUpdateService"/>
+    <bean class="org.dspace.storage.safstore.service.SAFItemRegisterService"/>
+    <bean class="org.dspace.storage.safstore.factory.SAFItemServiceFactory"/>
+    <bean class="org.dspace.storage.safstore.ItemRegisterCLITool" />
+    <bean id="safregister" class="org.dspace.storage.safstore.SAFItemRegisterServiceImpl"  scope="prototype"/>
+    <bean id="safupdate" class="org.dspace.storage.safstore.SAFItemUpdateServiceImpl" />
+    <!-- <bean id="itemChangeEventConsumer" class="org.dspace.storage.safstore.SAFBitStoreEventConsumer" /> -->
+    
 
 </beans>
+

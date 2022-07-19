@@ -10,10 +10,14 @@ package org.dspace.storage.safstore;
 import java.util.HashSet;
 import java.util.Optional;
 import java.util.Set;
+import java.util.stream.Collector;
 import java.util.stream.Collectors;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
-
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import org.apache.logging.log4j.Logger;
 import org.dspace.content.Bundle;
 import org.dspace.content.DSpaceObject;
@@ -26,6 +30,8 @@ import org.dspace.discovery.indexobject.factory.IndexObjectFactoryFactory;
 import org.dspace.event.Consumer;
 import org.dspace.event.Event;
 import org.dspace.services.factory.DSpaceServicesFactory;
+import org.dspace.storage.safstore.factory.SAFItemExportServiceFactory;
+import org.dspace.storage.safstore.service.SAFItemExportService;
 import org.dspace.discovery.IndexableObject;
 import org.dspace.discovery.IndexingService;
 import org.dspace.content.Item;
@@ -43,6 +49,9 @@ public class SAFBitStoreEventConsumer implements Consumer {
      * log4j logger
      */
     private static Logger log = org.apache.logging.log4j.LogManager.getLogger(SAFBitStoreEventConsumer.class);
+
+    protected static SAFItemExportService itemExportService = SAFItemExportServiceFactory.getInstance()
+            .getSAFItemExportService();
 
     // collect Items, Collections, Communities that need indexing
     private Set<DSpaceObject> objectsToUpdate = new HashSet<>();
@@ -89,6 +98,7 @@ public class SAFBitStoreEventConsumer implements Consumer {
         // It could be a new bitstream in the TEXT bundle which
         // would change the index.
         int et = event.getEventType();
+        log.debug("*********EVENT TYPE:" + et + " subject type: " + st);
         if (st == Constants.BUNDLE) {
             if ((et == Event.ADD || et == Event.REMOVE) && subject != null
                     && ((Bundle) subject).getName().equals("TEXT")) {
@@ -181,14 +191,27 @@ public class SAFBitStoreEventConsumer implements Consumer {
                  * decisions on indexing and/or removal
                  */
 
-                Item x = null;
-                if (iu instanceof Item) {
-                    x = (Item) iu;
+                List<Item> items = new ArrayList<Item>();
+                if (iu instanceof Bundle) {
+                    Bundle u = (Bundle) iu;
+                    items = u.getItems();
+                } else if (iu instanceof Bitstream) {
+                    Bitstream b = (Bitstream) iu;
+                    items = b.getBundles().stream().flatMap(d -> d.getItems().stream()).collect(Collectors
+                            .toCollection(ArrayList<Item>::new));
 
-                    List<Bitstream> b = x.getBundles().stream()
-                            .flatMap(s -> s.getBitstreams().stream())
-                            .collect(Collectors.toList());
-                    log.debug("First=" + b.get(0).getName() + " Bitstream_id=" + b.get(0).getInternalId());
+                } else if (iu instanceof Item) {
+                    Item b = (Item) iu;
+                    items = Collections.singletonList(b);
+
+                }
+
+                for (Item it : items) {
+
+                    log.debug("is item, **before itemExportService");
+                    itemExportService
+                            .updateItem(ctx, Collections.singletonList(it).iterator());
+                    log.debug("is item, ****after itemExportService");
 
                 }
 

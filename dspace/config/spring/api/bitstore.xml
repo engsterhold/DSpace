@@ -8,6 +8,8 @@
         <property name="stores">
             <map>
                 <entry key="0" value-ref="localStore"/>
+                <entry key="1" value-ref="safStore"/>
+                <entry key="2" value-ref="safStore2"/>
                 <!--<entry key="1" value-ref="s3Store"/>-->
             </map>
         </property>
@@ -15,6 +17,13 @@
 
     <bean name="localStore" class="org.dspace.storage.bitstore.DSBitStoreService" scope="singleton">
         <property name="baseDir" value="${assetstore.dir}"/>
+    </bean>
+    <bean name="safStore" class="org.dspace.storage.safstore.SAFBitStoreService" scope="singleton">
+        <property name="baseDir" value="${assetstore.dir.1}"/>
+        <property name="tempDir" value="${assetstore.dir.1.temp}"/>
+    </bean>
+        <bean name="safStore2" class="org.dspace.storage.bitstore.DSBitStoreService" scope="singleton">
+        <property name="baseDir" value="${assetstore.dir.2}"/>
     </bean>
 
     <bean name="s3Store" class="org.dspace.storage.bitstore.S3BitStoreService" scope="singleton">

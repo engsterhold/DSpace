@@ -18,13 +18,18 @@ RUN mkdir /install \
     && chown -Rv dspace: /install \
     && chown -Rv dspace: /app
 USER dspace
+# optimize cache
+COPY ./pom.xml ./pom.xml
+RUN mvn dependency:go-offline -B
+
 # Copy the DSpace source code (from local machine) into the workdir (excluding .dockerignore contents)
 ADD --chown=dspace . /app/
 # Build DSpace (INCLUDING the optional, deprecated "dspace-rest" webapp)
 # Copy the dspace-installer directory to /install.  Clean up the build to keep the docker image small
-RUN mvn package -Pdspace-rest && \
-  mv /app/dspace/target/${TARGET_DIR}/* /install && \
-  mvn clean
+RUN --mount=type=cache,target=/root/.m2,rw mvn package -DskipTests -Pdspace-rest && \
+    mv /app/dspace/target/${TARGET_DIR}/* /install
+#  && \
+#mvn clean
 
 # Step 2 - Run Ant Deploy
 FROM openjdk:${JDK_VERSION}-slim as ant_build

@@ -366,4 +366,18 @@
             <class>org.dspace.iiif.canvasdimension.CanvasDimensionCLI</class>
         </step>
     </command>
+    <command>
+        <name>import2</name>
+        <description>Custom register items into DSpace</description>
+        <step>
+            <class>org.dspace.storage.safstore.ItemImportCLITool2</class>
+        </step>
+    </command>
+        <command>
+        <name>export2</name>
+        <description>Custom export items from DSpace</description>
+        <step>
+            <class>org.dspace.storage.safstore.ItemExportCLITool2</class>
+        </step>
+    </command>
 </commands>

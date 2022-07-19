@@ -46,3 +46,7 @@ rebel.xml
 
 ## Ignore jenv configuration
 .java-version
+
+#custom store
+_saf_store
+_logs

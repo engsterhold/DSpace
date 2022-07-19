@@ -12,7 +12,7 @@
         <!-- Log level for all DSpace-specific code (org.dspace.*)
              Possible values (from most to least info):
 	     DEBUG, INFO, WARN, ERROR, FATAL -->
-        <Property name='loglevel.dspace'>INFO</Property>
+        <Property name='loglevel.dspace'>DEBUG</Property>
 
         <!-- Log level for other third-party tools/APIs used by DSpace
              Possible values (from most to least info):
@@ -23,7 +23,7 @@
     <Appenders>
         <!-- A1 is for most DSpace activity -->
         <Appender name='A1'
-                  filePattern="${log.dir}/dspace.log-%d{yyyy-MM-dd}"
+                  filePattern="${log.dir}/dspace.log-%d{yyyy-MM-dd}_%i"
                   type='RollingFile'
                   fileName='${log.dir}/dspace.log'
 
@@ -34,6 +34,7 @@
                     pattern='%d %-5p %equals{%X{correlationID}}{}{unknown} %equals{%X{requestID}}{}{unknown} %c @ %m%n'/>
             <policies>
                 <policy type='TimeBasedTriggeringPolicy'>yyyy-MM-dd</policy>
+                <OnStartupTriggeringPolicy/>
             </policies>
             <!-- Sample deletion policy:  keep last 30 archived files
             <DefaultRolloverStrategy>
